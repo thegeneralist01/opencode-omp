@@ -6,7 +6,7 @@ Intended for the free OpenCode models such as:
 
 - `opencode/deepseek-v4-flash-free`
 - `opencode/mimo-v2.5-free`
-- `opencode/nemotron-3-ultra-free`
+- `opencode/nemotron-3-super-free`
 - `opencode/big-pickle`
 
 ## Requirements
@@ -37,6 +37,11 @@ Smoke test:
 omp -p --provider opencode-cli --model opencode/deepseek-v4-flash-free "Reply with exactly OK"
 ```
 
+> **Installing from GitHub (before the next npm publish):**
+> ```bash
+> omp plugin install github:thegeneralist01/opencode-omp
+> ```
+
 ## Commands
 
 ```
@@ -60,19 +65,22 @@ OPENCODE_OMP_MODELS="opencode/deepseek-v4-flash-free,opencode/big-pickle" omp
 
 ## How it works
 
-For each OMP model turn, the extension:
+On the first model turn the extension starts a persistent `opencode serve` subprocess in a locked-down temp directory (all OpenCode tools denied). The server is reused across turns and shut down when the OMP session ends.
 
-1. Creates a temporary OpenCode project with a locked-down `omp-model` agent (all OpenCode tools denied).
-2. Serializes the OMP conversation context (system prompt, tools, message history) into a plain-text bridge prompt.
-3. Sends the prompt to `opencode run --format json` via stdin.
-4. Forwards the response text back into OMP (forwarded as incremental events if OpenCode emits them; current free models return one final chunk).
+For each turn:
+
+1. Serializes the OMP conversation context (system prompt, tools, message history) into a plain-text bridge prompt.
+2. Opens an SSE connection to `opencode serve`'s `/event` stream.
+3. Creates a new OpenCode session and sends the prompt via `POST /session/:id/prompt_async`.
+4. Streams `message.part.delta` and `message.part.updated` SSE events back to OMP as incremental `text_delta` events. User-message deltas are filtered by role; deltas that arrive before role confirmation are buffered and flushed when the `message.updated` event arrives.
 5. Converts `<omp_tool_call>{...}</omp_tool_call>` markers in the response into real OMP tool calls.
+6. Deletes the OpenCode session when the turn completes.
 
 File access and edits stay under OMP's normal tool pipeline; OpenCode cannot touch your filesystem.
 
 ## Limitations
 
-- CLI bridge, not a native HTTP provider — one `opencode run` subprocess per turn.
+- SSE bridge, not a native HTTP provider — streaming quality depends on what the underlying model exposes through OpenCode's event layer.
 - Tool calling is prompt-bridged; native providers will be more reliable for heavy tool use.
 - Image input is not supported (free models are text-only).
 - If OpenCode attempts its own tools, the turn fails rather than silently proceeding.
