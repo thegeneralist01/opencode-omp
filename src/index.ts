@@ -66,7 +66,6 @@ function maxTokensFor(model: string): number {
   return DEFAULT_MAX_TOKENS;
 }
 
-
 function runCapture(
   args: string[],
   input?: string,
@@ -94,9 +93,7 @@ function runCapture(
   child.on("error", (error) => { clearTimeout(timer); reject(error); });
   child.on("close", (code) => { clearTimeout(timer); resolve({ stdout, stderr, code }); });
 
-  if (input !== undefined) {
-    child.stdin!.end(input);
-  }
+  if (input !== undefined) child.stdin!.end(input);
 
   return promise;
 }
@@ -115,9 +112,7 @@ async function discoverModels(): Promise<{
   try {
     const result = await runCapture(["models", "opencode"]);
     if (result.code !== 0) {
-      throw new Error(
-        result.stderr.trim() || `opencode models exited with code ${result.code}`,
-      );
+      throw new Error(result.stderr.trim() || `opencode models exited with code ${result.code}`);
     }
     const discovered = result.stdout
       .split(/\r?\n/)
@@ -191,21 +186,14 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-function setEstimatedUsage(
-  output: AssistantMessage,
-  prompt: string,
-  text: string,
-) {
+function setEstimatedUsage(output: AssistantMessage, prompt: string, text: string) {
   if (output.usage.totalTokens > 0) return;
   output.usage.input = estimateTokens(prompt);
   output.usage.output = estimateTokens(text);
   output.usage.totalTokens = output.usage.input + output.usage.output;
-  // All opencode free models have zero cost — no calculateCost call needed.
 }
 
-function contentToText(
-  content: string | (TextContent | ImageContent)[],
-): string {
+function contentToText(content: string | (TextContent | ImageContent)[]): string {
   if (typeof content === "string") return content;
   return content
     .map((item) => {
@@ -225,7 +213,6 @@ function safeJson(value: unknown): string {
 
 function serializeMessage(message: Message): string {
   if (message.role === "user") {
-    // content is string | (TextContent | ImageContent)[]
     return `USER:\n${contentToText(message.content as string | (TextContent | ImageContent)[])}`;
   }
 
@@ -236,11 +223,8 @@ function serializeMessage(message: Message): string {
     ].join("\n");
   }
 
-  // assistant message — content may be string or mixed array
   const rawContent = message.content;
-  if (typeof rawContent === "string") {
-    return `ASSISTANT:\n${rawContent}`;
-  }
+  if (typeof rawContent === "string") return `ASSISTANT:\n${rawContent}`;
 
   const parts = (rawContent as unknown[]).map((part) => {
     if (part === null || typeof part !== "object") return String(part);
@@ -287,10 +271,7 @@ Rules for OMP tool calls:
   const sysPrompt = Array.isArray(context.systemPrompt)
     ? context.systemPrompt.join("\n").trim()
     : (context.systemPrompt ?? "").trim();
-
-  if (sysPrompt) {
-    sections.push(`# OMP system prompt\n\n${sysPrompt}`);
-  }
+  if (sysPrompt) sections.push(`# OMP system prompt\n\n${sysPrompt}`);
 
   sections.push(`# Available OMP tools\n\n${serializeTools(context.tools)}`);
 
@@ -312,9 +293,7 @@ function parseToolCalls(
   const trimmed = text.trim();
   const tagRegex = /<omp_tool_call>([\s\S]*?)<\/omp_tool_call>/g;
   const matches = [...trimmed.matchAll(tagRegex)];
-  if (matches.length > 0) {
-    return matches.flatMap((match) => parseToolCallJson(match[1] ?? ""));
-  }
+  if (matches.length > 0) return matches.flatMap((match) => parseToolCallJson(match[1] ?? ""));
   return parseToolCallJson(trimmed);
 }
 
@@ -340,20 +319,14 @@ function parseToolCallJson(
   const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
   for (const candidate of candidates) {
     if (candidate === null || typeof candidate !== "object") continue;
-
     let name: string | undefined;
-    if ("name" in candidate && typeof candidate.name === "string") {
-      name = candidate.name;
-    } else if ("tool" in candidate && typeof candidate.tool === "string") {
-      name = candidate.tool;
-    }
+    if ("name" in candidate && typeof candidate.name === "string") name = candidate.name;
+    else if ("tool" in candidate && typeof candidate.tool === "string") name = candidate.tool;
     if (!name) continue;
-
     let args: unknown = {};
     if ("arguments" in candidate) args = candidate.arguments;
     else if ("args" in candidate) args = candidate.args;
     else if ("input" in candidate) args = candidate.input;
-
     if (typeof args !== "object" || args === null || Array.isArray(args)) continue;
     calls.push({ name, arguments: args as Record<string, unknown> });
   }
@@ -393,7 +366,6 @@ You are the OpenCode side of an OMP coding agent bridge. OpenCode tools are disa
   return dir;
 }
 
-/** Reads a numeric field from a plain object without inline casts. */
 function readNumber(obj: Record<string, unknown>, key: string, fallback = 0): number {
   const v = obj[key];
   const n = Number(v);
@@ -421,6 +393,13 @@ function streamOpenCode(
 
     let tempDir: string | undefined;
     let accumulatedText = "";
+    // Streaming state machine:
+    //   "gating"    – holding initial chunks until first non-whitespace reveals intent
+    //   "streaming" – prose confirmed; pushing text_delta events live
+    //   "buffered"  – tool-call candidate (<, {, [); parse at close, never stream
+    // Wrapped in an object so TypeScript does not narrow the property across
+    // await points (let variables can be narrowed; object properties cannot).
+    const st = { textMode: "gating" as "gating" | "streaming" | "buffered", gateBuffer: "", textContentIndex: -1 };
     let stderr = "";
     let stdoutRemainder = "";
     let opencodeToolUse: string | undefined;
@@ -469,7 +448,38 @@ function streamOpenCode(
             : undefined;
 
         if (type === "text" && part && typeof part.text === "string") {
-          accumulatedText += part.text;
+          const delta = part.text;
+          accumulatedText += delta;
+
+          if (st.textMode === "buffered") return;
+
+          if (st.textMode === "streaming") {
+            const block = (output.content as unknown[])[st.textContentIndex] as { text: string };
+            block.text += delta;
+            stream.push({ type: "text_delta", contentIndex: st.textContentIndex, delta, partial: output });
+            return;
+          }
+
+          // gating: wait until first non-whitespace to decide
+          st.gateBuffer += delta;
+          const firstNonWS = st.gateBuffer.trimStart()[0];
+          if (firstNonWS === undefined) return; // still all whitespace
+
+          if (firstNonWS === "<" || firstNonWS === "{" || firstNonWS === "[") {
+            // Looks like a tool-call candidate — buffer everything, parse at close.
+            st.textMode = "buffered";
+          } else {
+            // Prose — commit to live streaming.
+            st.textMode = "streaming";
+            st.textContentIndex = (output.content as unknown[]).length;
+            (output.content as unknown[]).push({ type: "text", text: "" });
+            stream.push({ type: "text_start", contentIndex: st.textContentIndex, partial: output });
+            // Now fill the block and push the buffered gate content as a delta.
+            const gateBlock = (output.content as unknown[])[st.textContentIndex] as { text: string };
+            gateBlock.text = st.gateBuffer;
+            stream.push({ type: "text_delta", contentIndex: st.textContentIndex, delta: st.gateBuffer, partial: output });
+            st.gateBuffer = "";
+          }
           return;
         }
 
@@ -486,10 +496,8 @@ function streamOpenCode(
             output.usage.cacheRead = readNumber(cache, "read");
             output.usage.cacheWrite = readNumber(cache, "write");
             const totalFallback =
-              output.usage.input +
-              output.usage.output +
-              output.usage.cacheRead +
-              output.usage.cacheWrite;
+              output.usage.input + output.usage.output +
+              output.usage.cacheRead + output.usage.cacheWrite;
             output.usage.totalTokens = readNumber(t, "total") || totalFallback;
           }
           return;
@@ -501,9 +509,6 @@ function streamOpenCode(
         }
 
         if (type === "error") {
-          // Accumulate error events from opencode's JSON stream separately so
-          // they surface as the primary error message rather than mixing with
-          // opencode's own process stderr logs.
           const msg =
             "part" in event && typeof (event as Record<string, unknown>).part === "object"
               ? safeJson((event as Record<string, unknown>).part)
@@ -532,9 +537,7 @@ function streamOpenCode(
       if (stdoutRemainder.trim()) handleLine(stdoutRemainder);
 
       if (options?.signal?.aborted) throw new Error("Request was aborted");
-      if (code !== 0) {
-        throw new Error(stderr.trim() || `opencode exited with code ${code}`);
-      }
+      if (code !== 0) throw new Error(stderr.trim() || `opencode exited with code ${code}`);
       if (opencodeToolUse) {
         throw new Error(
           `OpenCode attempted to use its own tool (${opencodeToolUse}). ` +
@@ -542,41 +545,46 @@ function streamOpenCode(
         );
       }
 
-      const toolCalls = parseToolCalls(accumulatedText);
       setEstimatedUsage(output, prompt, accumulatedText);
 
-      if (toolCalls.length > 0) {
-        output.stopReason = "toolUse";
-        for (const call of toolCalls) {
-          const toolCall: ToolCall = {
-            type: "toolCall",
-            id: `opencode_omp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            name: call.name,
-            arguments: call.arguments,
-          };
-          const contentIndex = (output.content as unknown[]).length;
-          (output.content as unknown[]).push(toolCall);
-          stream.push({ type: "toolcall_start", contentIndex, partial: output });
-          stream.push({
-            type: "toolcall_delta",
-            contentIndex,
-            delta: safeJson(toolCall.arguments),
-            partial: output,
-          });
-          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+      // Only the buffered/gating paths are candidates for tool calls.
+      // If we committed to streaming, the deltas are already in-flight as prose.
+      if (st.textMode !== "streaming") {
+        const toolCalls = parseToolCalls(accumulatedText);
+        if (toolCalls.length > 0) {
+          output.stopReason = "toolUse";
+          for (const call of toolCalls) {
+            const toolCall: ToolCall = {
+              type: "toolCall",
+              id: `opencode_omp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+              name: call.name,
+              arguments: call.arguments,
+            };
+            const contentIndex = (output.content as unknown[]).length;
+            (output.content as unknown[]).push(toolCall);
+            stream.push({ type: "toolcall_start", contentIndex, partial: output });
+            stream.push({ type: "toolcall_delta", contentIndex, delta: safeJson(toolCall.arguments), partial: output });
+            stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+          }
+          stream.push({ type: "done", reason: "toolUse", message: output });
+          stream.end();
+          return;
         }
-        stream.push({ type: "done", reason: "toolUse", message: output });
-        stream.end();
-        return;
       }
 
-      const contentIndex = (output.content as unknown[]).length;
-      (output.content as unknown[]).push({ type: "text", text: accumulatedText });
-      stream.push({ type: "text_start", contentIndex, partial: output });
-      if (accumulatedText) {
-        stream.push({ type: "text_delta", contentIndex, delta: accumulatedText, partial: output });
+      // Text response: close the live streaming block, or emit buffered/gating
+      // text as a single block if we never committed to streaming.
+      if (st.textMode === "streaming") {
+        stream.push({ type: "text_end", contentIndex: st.textContentIndex, content: accumulatedText, partial: output });
+      } else {
+        st.textContentIndex = (output.content as unknown[]).length;
+        (output.content as unknown[]).push({ type: "text", text: accumulatedText });
+        stream.push({ type: "text_start", contentIndex: st.textContentIndex, partial: output });
+        if (accumulatedText) {
+          stream.push({ type: "text_delta", contentIndex: st.textContentIndex, delta: accumulatedText, partial: output });
+        }
+        stream.push({ type: "text_end", contentIndex: st.textContentIndex, content: accumulatedText, partial: output });
       }
-      stream.push({ type: "text_end", contentIndex, content: accumulatedText, partial: output });
       stream.push({ type: "done", reason: "stop", message: output });
       stream.end();
     } catch (error) {
@@ -657,22 +665,13 @@ export default async function openCodeOmpExtension(pi: ExtensionAPI) {
       }
       if (sub === "models") {
         for (const model of registeredModels) ctx.ui.notify(`${PROVIDER_ID}/${model}`, "info");
-        ctx.ui.notify(
-          `Override with OPENCODE_OMP_MODELS="opencode/model-a,opencode/model-b"`,
-          "info",
-        );
+        ctx.ui.notify(`Override with OPENCODE_OMP_MODELS="opencode/model-a,opencode/model-b"`, "info");
         return;
       }
       if (sub === "test") {
         const testModel = registeredModels[0] ?? DEFAULT_FREE_MODELS[0];
-        ctx.ui.notify(
-          `Run: omp -p --provider ${PROVIDER_ID} --model ${testModel} "Reply with exactly OK"`,
-          "info",
-        );
-        ctx.ui.notify(
-          `OpenCode check: ${opencodeBin()} run -m ${testModel} --format json "Reply OK"`,
-          "info",
-        );
+        ctx.ui.notify(`Run: omp -p --provider ${PROVIDER_ID} --model ${testModel} "Reply with exactly OK"`, "info");
+        ctx.ui.notify(`OpenCode check: ${opencodeBin()} run -m ${testModel} --format json "Reply OK"`, "info");
         return;
       }
       if (sub === "update") {
@@ -683,16 +682,10 @@ export default async function openCodeOmpExtension(pi: ExtensionAPI) {
       if (sub === "help") {
         ctx.ui.notify("Usage: /opencode-omp [status|models|test|update|help]", "info");
         ctx.ui.notify("Set OPENCODE_OMP_BIN to override the opencode executable.", "info");
-        ctx.ui.notify(
-          "Set OPENCODE_OMP_MODELS to register a custom comma-separated model list.",
-          "info",
-        );
+        ctx.ui.notify(`Set OPENCODE_OMP_MODELS to register a custom comma-separated model list.`, "info");
         return;
       }
-      ctx.ui.notify(
-        `Unknown /opencode-omp subcommand: ${sub}. Try /opencode-omp help`,
-        "warning",
-      );
+      ctx.ui.notify(`Unknown /opencode-omp subcommand: ${sub}. Try /opencode-omp help`, "warning");
     },
   });
 }
