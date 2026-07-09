@@ -2,7 +2,7 @@
  * Spike v4: collect ALL part updates, resolve roles post-hoc at session.idle,
  * then report per-model whether assistant text is streamed incrementally.
  * Run: bun spike/sse-test.ts [modelID]   (default: deepseek-v4-flash-free)
- * Run all: for m in deepseek-v4-flash-free mimo-v2.5-free nemotron-3-ultra-free big-pickle; do bun spike/sse-test.ts $m; done
+ * Run all: for m in deepseek-v4-flash-free mimo-v2.5-free nemotron-3-super-free big-pickle; do bun spike/sse-test.ts $m; done
  */
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -93,7 +93,7 @@ await fetch(`${BASE}/session/${session.id}/prompt_async`, {
     model: { providerID: "opencode", modelID: MODEL_ID },
     tools: { bash: false, edit: false, read: false, glob: false, grep: false,
              list: false, task: false, webfetch: false, websearch: false, todowrite: false },
-    parts: [{ type: "text", text: "Count from 1 to 5, one number per line, nothing else." }],
+    parts: [{ type: "text", text: "Explain in detail how TCP/IP works, covering the handshake, packet routing, congestion control, and error recovery. Be thorough." }],
   }),
 });
 
