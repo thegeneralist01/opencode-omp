@@ -1,6 +1,6 @@
 {
   "name": "opencode-omp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bridge OpenCode CLI free models into OMP without OpenCode login",
   "type": "module",
   "main": "./src/index.ts",
