@@ -1,12 +1,19 @@
 /**
- * Smoke test for the gating-buffer streaming logic.
+ * Smoke test for the event-bridge protocol.
  * Run with: bun test/smoke.ts
  *
  * Uses a fake opencode binary so no real model call is made.
- * Covers two paths:
- *   1. Prose response  → text_start / text_delta(×N) / text_end / done(stop)
- *                        with correct delta strings and no duplication
- *   2. Tool-call response → no text events, toolcall_end / done(toolUse)
+ * Verifies the bridge correctly handles two response shapes:
+ *
+ *   1. Prose — gating buffer detects non-tool-call text and forwards
+ *      text_start / text_delta(×N) / text_end / done(stop).
+ *      Note: real free OpenCode models return the full response as a single
+ *      assistant chunk (no incremental tokens). The bridge forwards incremental
+ *      events if OpenCode emits them; this test proves the forwarding logic is
+ *      correct when multiple chunks do arrive.
+ *
+ *   2. Tool-call candidate — gating buffer detects leading `<`/`{`/`[` and
+ *      buffers to close; emits no text events, toolcall_end / done(toolUse).
  *
  * Note on partial-snapshot timing: `partial` is a mutable reference shared
  * across all events. The `for await` consumer resumes in a microtask; by then

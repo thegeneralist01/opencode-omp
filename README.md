@@ -65,7 +65,7 @@ For each OMP model turn, the extension:
 1. Creates a temporary OpenCode project with a locked-down `omp-model` agent (all OpenCode tools denied).
 2. Serializes the OMP conversation context (system prompt, tools, message history) into a plain-text bridge prompt.
 3. Sends the prompt to `opencode run --format json` via stdin.
-4. Streams the response text back into OMP.
+4. Forwards the response text back into OMP (forwarded as incremental events if OpenCode emits them; current free models return one final chunk).
 5. Converts `<omp_tool_call>{...}</omp_tool_call>` markers in the response into real OMP tool calls.
 
 File access and edits stay under OMP's normal tool pipeline; OpenCode cannot touch your filesystem.
