@@ -26,6 +26,7 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "omp-model";
+const VERSION = "1.2.0";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
 const DISCOVERY_TIMEOUT_MS = 8_000;
@@ -39,7 +40,6 @@ const DEFAULT_FREE_MODELS = [
   "opencode/big-pickle",
 ];
 
-/** Tools to disable in prompt_async — agent file already denies them, belt+suspenders. */
 const DISABLED_TOOLS: Record<string, false> = {
   bash: false, edit: false, read: false, glob: false, grep: false,
   list: false, task: false, webfetch: false, websearch: false, todowrite: false,
@@ -49,61 +49,42 @@ const DISABLED_TOOLS: Record<string, false> = {
 // Named types
 // ---------------------------------------------------------------------------
 
-/** A running opencode serve subprocess. */
 interface OcServer {
   url: string;
   proc: ChildProcess;
 }
 
-/** Properties of a `message.part.delta` SSE event (flat/v1 shape observed in spike). */
 interface OcPartDelta {
   sessionID: string;
   messageID: string;
-  /** Part identity — used to keep part text maps consistent with snapshot updates. */
   partID: string;
-  /** "text" for response text; "reasoning" for model thinking. */
   field: string;
   delta: string;
 }
 
-/**
- * Minimal Part shape from `message.part.updated` properties.
- * Includes `id` and `text` so snapshot-only updates (no `delta` field) can be
- * diffed against the previously accumulated text for that part.
- */
 interface OcPartRef {
   id: string;
-  /** "text" | "reasoning" | other part types. */
   type: string;
   sessionID: string;
   messageID: string;
-  /** Full accumulated text at this point — present for TextPart and ReasoningPart. */
   text?: string;
 }
 
-/**
- * Properties of a `message.part.updated` SSE event (SDK canonical shape).
- * `delta` is incremental when present; when absent derive it from `part.text`
- * against the stored snapshot in the relevant map.
- */
 interface OcPartUpdatedProps {
   part: OcPartRef;
   delta?: string;
 }
 
-/** `message.updated` info field — full Message reduced to the fields we need. */
 interface OcMessageInfo {
   id: string;
   role: string;
   sessionID: string;
 }
 
-/** Properties of a `message.updated` SSE event. */
 interface OcMessageUpdated {
   info: OcMessageInfo;
 }
 
-/** Properties of a `session.idle` SSE event. */
 interface OcSessionIdle {
   sessionID: string;
 }
@@ -117,10 +98,7 @@ type NotifyFn = (msg: string, level?: "error" | "info" | "warning") => void;
 let registeredModels: string[] = [];
 let lastDiscoveryTime: number | undefined;
 let lastDiscoveryError: string | undefined;
-
-/** Persistent temp dir with the locked-down agent config. Created once. */
 let ocAgentDir: string | undefined;
-/** Running opencode server. Shared across turns; reset to undefined on crash. */
 let ocServer: OcServer | undefined;
 
 // ---------------------------------------------------------------------------
@@ -297,7 +275,6 @@ async function ensureServer(): Promise<string> {
 
   const dir = await ensureAgentDir();
   const port = 49000 + Math.floor(Math.random() * 5000);
-
   const { promise, resolve, reject } = Promise.withResolvers<string>();
 
   const proc = spawn(opencodeBin(), ["serve", `--port=${port}`], {
@@ -520,47 +497,26 @@ function streamOpenCode(
       timestamp: Date.now(),
     };
 
-    /**
-     * Whether this turn has OMP tools available.
-     * When true, ALL text deltas are accumulated silently — never pushed as
-     * text_delta events — so reasoning preamble + <omp_tool_call> XML never
-     * leak into the UI before we know the final response type.
-     * At session.idle: tool calls found → emit only toolcall events;
-     * pure text → emit as a single block.
-     */
     const hasTool = (context.tools?.length ?? 0) > 0;
 
-    // Gating buffer used only when !hasTool (pure prose turns).
     const st = {
       textMode: "gating" as "gating" | "streaming" | "buffered",
       gateBuffer: "",
       textContentIndex: -1,
     };
 
-    // Reasoning (thinking) state.
     let reasoningContentIndex = -1;
-
     let accumulatedText = "";
     let sessionId: string | undefined;
     let sseReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     const prompt = buildPrompt(context);
 
-    // ── Role-filtered dispatch state ──────────────────────────────────────────
-    //
-    // assistantMsgIds         messageIDs confirmed as role=assistant.
-    // pendingDeltas           text deltas buffered while role is unconfirmed.
-    // pendingReasoningDeltas  reasoning deltas buffered while role is unconfirmed.
-    //                         Mirrors pendingDeltas exactly — OpenCode may emit
-    //                         reasoning before message.updated confirms the role.
-    // partTextById            accumulated text per text-part ID (snapshot diffing).
-    // reasoningTextById       accumulated text per reasoning-part ID.
     const assistantMsgIds = new Set<string>();
     const pendingDeltas = new Map<string, string[]>();
     const pendingReasoningDeltas = new Map<string, string[]>();
     const partTextById = new Map<string, string>();
     const reasoningTextById = new Map<string, string>();
 
-    /** Emit one reasoning delta through the thinking channel. */
     const handleReasoningDelta = (delta: string): void => {
       if (!delta) return;
       if (reasoningContentIndex === -1) {
@@ -573,11 +529,6 @@ function streamOpenCode(
       stream.push({ type: "thinking_delta", contentIndex: reasoningContentIndex, delta, partial: output });
     };
 
-    /**
-     * Route a reasoning delta through the assistant role filter.
-     * Buffers into pendingReasoningDeltas when role is not yet confirmed,
-     * mirroring the text pendingDeltas pattern.
-     */
     const dispatchReasoning = (msgId: string, delta: string): void => {
       if (!delta) return;
       if (assistantMsgIds.has(msgId)) {
@@ -589,14 +540,9 @@ function streamOpenCode(
       }
     };
 
-    /**
-     * Apply one text delta:
-     * - hasTool=true  → accumulate only; never push text events mid-stream.
-     * - hasTool=false → gate on first char (prose vs tool-call candidate).
-     */
     const handleTextDelta = (delta: string): void => {
       accumulatedText += delta;
-      if (hasTool) return; // defer all streaming until session.idle
+      if (hasTool) return;
 
       if (st.textMode === "buffered") return;
 
@@ -607,7 +553,6 @@ function streamOpenCode(
         return;
       }
 
-      // gating: accumulate until the first non-whitespace character reveals intent.
       st.gateBuffer += delta;
       const firstNonWS = st.gateBuffer.trimStart()[0];
       if (firstNonWS === undefined) return;
@@ -626,7 +571,6 @@ function streamOpenCode(
       }
     };
 
-    /** Dispatch a text delta through the role filter / pending buffer. */
     const dispatchDelta = (msgId: string, delta: string): void => {
       if (!delta) return;
       if (assistantMsgIds.has(msgId)) {
@@ -638,10 +582,6 @@ function streamOpenCode(
       }
     };
 
-    /**
-     * Called when message.updated confirms msgId is role=assistant.
-     * Flushes both text and reasoning deltas buffered before confirmation.
-     */
     const flushPending = (msgId: string): void => {
       const pendingText = pendingDeltas.get(msgId);
       if (pendingText) {
@@ -703,7 +643,6 @@ function streamOpenCode(
       });
       if (!promptResp.ok) throw new Error(`prompt_async failed: ${promptResp.status}`);
 
-      // ── SSE loop ────────────────────────────────────────────────────────────
       const dec = new TextDecoder();
       let sseRemainder = "";
       let done = false;
@@ -726,13 +665,11 @@ function streamOpenCode(
             const props = ev.properties as OcMessageUpdated;
             if (props.info.sessionID === sessionId && props.info.role === "assistant") {
               assistantMsgIds.add(props.info.id);
-              flushPending(props.info.id); // flushes both text and reasoning pending
+              flushPending(props.info.id);
             }
-
           } else if (ev.type === "message.part.delta") {
             const props = ev.properties as OcPartDelta;
             if (props.sessionID !== sessionId || !props.delta) continue;
-
             if (props.field === "text") {
               const prev = partTextById.get(props.partID) ?? "";
               partTextById.set(props.partID, prev + props.delta);
@@ -742,11 +679,9 @@ function streamOpenCode(
               reasoningTextById.set(props.partID, prev + props.delta);
               dispatchReasoning(props.messageID, props.delta);
             }
-
           } else if (ev.type === "message.part.updated") {
             const props = ev.properties as OcPartUpdatedProps;
             if (props.part.sessionID !== sessionId) continue;
-
             if (props.part.type === "text") {
               const partId = props.part.id;
               const fullText = props.part.text;
@@ -754,7 +689,6 @@ function streamOpenCode(
               const delta = props.delta ?? (fullText !== undefined ? fullText.slice(prev.length) : "");
               partTextById.set(partId, fullText ?? prev + delta);
               dispatchDelta(props.part.messageID, delta);
-
             } else if (props.part.type === "reasoning") {
               const partId = props.part.id;
               const fullText = props.part.text;
@@ -763,7 +697,6 @@ function streamOpenCode(
               reasoningTextById.set(partId, fullText ?? prev + delta);
               dispatchReasoning(props.part.messageID, delta);
             }
-
           } else if (ev.type === "session.idle") {
             const props = ev.properties as OcSessionIdle;
             if (props.sessionID === sessionId) { done = true; break; }
@@ -778,20 +711,13 @@ function streamOpenCode(
 
       setEstimatedUsage(output, prompt, accumulatedText);
 
-      // Close any open reasoning block before emitting the response.
       if (reasoningContentIndex !== -1) {
         const block = (output.content as unknown[])[reasoningContentIndex] as { thinking: string };
         stream.push({ type: "thinking_end", contentIndex: reasoningContentIndex, content: block.thinking, partial: output });
       }
 
-      // ── Tool call detection ─────────────────────────────────────────────────
-      // Always scan regardless of textMode. For hasTool=true nothing was
-      // streamed yet, so tool calls (even after a preamble) produce clean
-      // toolcall-only output with no leaked text.
       const toolCalls = parseToolCalls(accumulatedText);
       if (toolCalls.length > 0) {
-        // hasTool=false fallback: model disobeyed no-preamble instruction.
-        // Close the open streaming text block; preamble is visible but tool executes.
         if (st.textMode === "streaming") {
           stream.push({ type: "text_end", contentIndex: st.textContentIndex, content: accumulatedText, partial: output });
         }
@@ -814,7 +740,6 @@ function streamOpenCode(
         return;
       }
 
-      // ── Pure text response ──────────────────────────────────────────────────
       if (st.textMode === "streaming") {
         stream.push({ type: "text_end", contentIndex: st.textContentIndex, content: accumulatedText, partial: output });
       } else {
@@ -847,6 +772,7 @@ function streamOpenCode(
 
 function statusLines(): string[] {
   const lines = [
+    `opencode-omp version: ${VERSION}`,
     `Provider: ${PROVIDER_ID}`,
     `OpenCode binary: ${opencodeBin()}`,
     `OpenCode installed: ${existsSync(opencodeBin()) || opencodeBin() === "opencode" ? "yes (check PATH)" : "no"}`,
@@ -891,7 +817,7 @@ export default async function openCodeOmpExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.notify(
-      `opencode-omp: registered ${registeredModels.length} OpenCode CLI model(s). Use /model and pick ${PROVIDER_ID}.`,
+      `opencode-omp ${VERSION}: registered ${registeredModels.length} OpenCode CLI model(s). Use /model and pick ${PROVIDER_ID}.`,
       "info",
     );
     if (lastDiscoveryError) {
