@@ -59,8 +59,9 @@ interface OcServer {
 interface OcPartDelta {
   sessionID: string;
   messageID: string;
-  /** Part identity — used to keep `partTextById` consistent with snapshot updates. */
+  /** Part identity — used to keep part text maps consistent with snapshot updates. */
   partID: string;
+  /** "text" for response text; "reasoning" for model thinking. */
   field: string;
   delta: string;
 }
@@ -72,17 +73,18 @@ interface OcPartDelta {
  */
 interface OcPartRef {
   id: string;
+  /** "text" | "reasoning" | other part types. */
   type: string;
   sessionID: string;
   messageID: string;
-  /** Full accumulated text at this point — present for TextPart. */
+  /** Full accumulated text at this point — present for TextPart and ReasoningPart. */
   text?: string;
 }
 
 /**
  * Properties of a `message.part.updated` SSE event (SDK canonical shape).
  * `delta` is incremental when present; when absent derive it from `part.text`
- * against the stored snapshot in `partTextById`.
+ * against the stored snapshot in the relevant map.
  */
 interface OcPartUpdatedProps {
   part: OcPartRef;
@@ -281,7 +283,6 @@ permission:
 You are the OpenCode side of an OMP coding agent bridge. OpenCode tools are disabled. Reply in plain text, or emit <omp_tool_call>{"name":"...","arguments":{...}}</omp_tool_call> exactly when the prompt asks you to request an OMP tool.
 `;
 
-/** Create (once) a persistent temp dir containing the locked-down agent config. */
 async function ensureAgentDir(): Promise<string> {
   if (ocAgentDir) return ocAgentDir;
   const dir = await mkdtemp(join(tmpdir(), "opencode-omp-"));
@@ -291,7 +292,6 @@ async function ensureAgentDir(): Promise<string> {
   return dir;
 }
 
-/** Start (once) opencode serve in the agent dir; reuse across turns. */
 async function ensureServer(): Promise<string> {
   if (ocServer) return ocServer.url;
 
@@ -314,13 +314,10 @@ async function ensureServer(): Promise<string> {
   proc.stdout!.setEncoding("utf8");
   proc.stdout!.on("data", (chunk: string) => {
     const match = chunk.match(/on\s+(https?:\/\/[^\s]+)/);
-    if (match) {
-      clearTimeout(timer);
-      resolve(match[1]);
-    }
+    if (match) { clearTimeout(timer); resolve(match[1]); }
   });
   proc.on("error", (err) => { clearTimeout(timer); reject(err); });
-  proc.on("exit", () => { ocServer = undefined; }); // reset if server crashes
+  proc.on("exit", () => { ocServer = undefined; });
 
   const url = await promise;
   ocServer = { url, proc };
@@ -345,11 +342,7 @@ async function cleanupAgentDir(): Promise<void> {
 
 function emptyUsage(): AssistantMessage["usage"] {
   return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
 }
@@ -376,11 +369,7 @@ function contentToText(content: string | (TextContent | ImageContent)[]): string
 }
 
 function safeJson(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
+  try { return JSON.stringify(value, null, 2); } catch { return String(value); }
 }
 
 function serializeMessage(message: Message): string {
@@ -411,13 +400,7 @@ function serializeMessage(message: Message): string {
 
 function serializeTools(tools?: Tool[]): string {
   if (!tools || tools.length === 0) return "No OMP tools are available for this turn.";
-  return safeJson(
-    tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.parameters,
-    })),
-  );
+  return safeJson(tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })));
 }
 
 function buildPrompt(context: Context): string {
@@ -427,15 +410,23 @@ function buildPrompt(context: Context): string {
 You are being used as the model backend for Oh My Pi (OMP) coding agent through the OpenCode CLI.
 OpenCode's own tools are disabled. Do not try to use OpenCode tools.
 
-If you need OMP to run a tool, output only one or more tool-call blocks and no prose:
-<omp_tool_call>{"name":"tool_name","arguments":{}}</omp_tool_call>
+OUTPUT RULES — follow exactly:
 
-Rules for OMP tool calls:
-- Use only tools listed in the "Available OMP tools" section.
-- The JSON inside <omp_tool_call> must be valid JSON with "name" and "arguments" fields.
-- Do not wrap tool calls in Markdown fences.
-- If you can answer without a tool, answer normally in plain text.
-- After OMP returns tool results, continue from the transcript and either answer or request another OMP tool call.`);
+1. If you need OMP to run a tool, output ONLY the tool-call block(s) with absolutely no preamble,
+   explanation, or prose before or after:
+   <omp_tool_call>{"name":"tool_name","arguments":{}}</omp_tool_call>
+   Do not say "Let me read..." or "I'll check...". Start the output with <omp_tool_call> immediately.
+
+2. If you can answer without a tool, answer in plain text only — no XML tags.
+
+3. After OMP returns tool results, either answer in plain text or emit another tool call.
+
+4. The JSON inside <omp_tool_call> must be valid JSON with "name" and "arguments" fields.
+   Use only tools listed in the "Available OMP tools" section.
+   Do not wrap tool calls in Markdown fences.
+
+5. Do not output internal reasoning or thinking as part of your response text.
+   If you need to think, do it silently — never include it in the output.`);
 
   const sysPrompt = Array.isArray(context.systemPrompt)
     ? context.systemPrompt.join("\n").trim()
@@ -445,9 +436,7 @@ Rules for OMP tool calls:
   sections.push(`# Available OMP tools\n\n${serializeTools(context.tools)}`);
 
   if (context.messages.length > 0) {
-    sections.push(
-      `# Conversation transcript\n\n${context.messages.map(serializeMessage).join("\n\n---\n\n")}`,
-    );
+    sections.push(`# Conversation transcript\n\n${context.messages.map(serializeMessage).join("\n\n---\n\n")}`);
   } else {
     sections.push("# Conversation transcript\n\n(no prior messages)");
   }
@@ -456,9 +445,7 @@ Rules for OMP tool calls:
   return sections.join("\n\n---\n\n");
 }
 
-function parseToolCalls(
-  text: string,
-): Array<{ name: string; arguments: Record<string, unknown> }> {
+function parseToolCalls(text: string): Array<{ name: string; arguments: Record<string, unknown> }> {
   const trimmed = text.trim();
   const tagRegex = /<omp_tool_call>([\s\S]*?)<\/omp_tool_call>/g;
   const matches = [...trimmed.matchAll(tagRegex)];
@@ -466,18 +453,13 @@ function parseToolCalls(
   return parseToolCallJson(trimmed);
 }
 
-function parseToolCallJson(
-  raw: string,
-): Array<{ name: string; arguments: Record<string, unknown> }> {
+function parseToolCallJson(raw: string): Array<{ name: string; arguments: Record<string, unknown> }> {
   let value: unknown;
   try { value = JSON.parse(raw.trim()); } catch { return []; }
 
   const candidates: unknown[] = Array.isArray(value)
     ? value
-    : value !== null &&
-        typeof value === "object" &&
-        "tool_calls" in value &&
-        Array.isArray(value.tool_calls)
+    : value !== null && typeof value === "object" && "tool_calls" in value && Array.isArray(value.tool_calls)
       ? value.tool_calls
       : [value];
 
@@ -502,7 +484,6 @@ function parseToolCallJson(
 // SSE parsing
 // ---------------------------------------------------------------------------
 
-/** Parse raw SSE text blocks into JSON event objects. */
 function parseSseBlocks(raw: string): Array<{ type: string; properties: unknown }> {
   const events: Array<{ type: string; properties: unknown }> = [];
   for (const block of raw.split(/\n\n/)) {
@@ -510,10 +491,8 @@ function parseSseBlocks(raw: string): Array<{ type: string; properties: unknown 
     if (!dataLine) continue;
     try {
       const ev = JSON.parse(dataLine.slice(5).trim()) as { type?: unknown; properties?: unknown };
-      if (typeof ev.type === "string") {
-        events.push({ type: ev.type, properties: ev.properties ?? {} });
-      }
-    } catch { /* skip malformed lines */ }
+      if (typeof ev.type === "string") events.push({ type: ev.type, properties: ev.properties ?? {} });
+    } catch { /* skip malformed */ }
   }
   return events;
 }
@@ -541,13 +520,25 @@ function streamOpenCode(
       timestamp: Date.now(),
     };
 
-    // Gating buffer: "gating" until first non-WS; "streaming" for prose;
-    // "buffered" for tool-call candidates (starts with <, {, [).
+    /**
+     * Whether this turn has OMP tools available.
+     * When true, ALL text deltas are accumulated silently — never pushed as
+     * text_delta events — so reasoning preamble + <omp_tool_call> XML never
+     * leak into the UI before we know the final response type.
+     * At session.idle: tool calls found → emit only toolcall events;
+     * pure text → emit as a single block.
+     */
+    const hasTool = (context.tools?.length ?? 0) > 0;
+
+    // Gating buffer used only when !hasTool (pure prose turns).
     const st = {
       textMode: "gating" as "gating" | "streaming" | "buffered",
       gateBuffer: "",
       textContentIndex: -1,
     };
+
+    // Reasoning (thinking) state.
+    let reasoningContentIndex = -1;
 
     let accumulatedText = "";
     let sessionId: string | undefined;
@@ -555,20 +546,57 @@ function streamOpenCode(
     const prompt = buildPrompt(context);
 
     // ── Role-filtered dispatch state ──────────────────────────────────────────
-    // assistantMsgIds: messageIDs confirmed as role=assistant for this session.
-    // pendingDeltas:   text deltas buffered while role is still unconfirmed
-    //                  (delta arrived before the matching message.updated).
-    // partTextById:    accumulated text per part ID, kept consistent across
-    //                  BOTH flat `message.part.delta` (partID field) and SDK
-    //                  `message.part.updated` (part.id field) so that a later
-    //                  snapshot-only update can derive its increment correctly.
+    //
+    // assistantMsgIds         messageIDs confirmed as role=assistant.
+    // pendingDeltas           text deltas buffered while role is unconfirmed.
+    // pendingReasoningDeltas  reasoning deltas buffered while role is unconfirmed.
+    //                         Mirrors pendingDeltas exactly — OpenCode may emit
+    //                         reasoning before message.updated confirms the role.
+    // partTextById            accumulated text per text-part ID (snapshot diffing).
+    // reasoningTextById       accumulated text per reasoning-part ID.
     const assistantMsgIds = new Set<string>();
     const pendingDeltas = new Map<string, string[]>();
+    const pendingReasoningDeltas = new Map<string, string[]>();
     const partTextById = new Map<string, string>();
+    const reasoningTextById = new Map<string, string>();
 
-    /** Apply one text delta through the gating buffer. */
+    /** Emit one reasoning delta through the thinking channel. */
+    const handleReasoningDelta = (delta: string): void => {
+      if (!delta) return;
+      if (reasoningContentIndex === -1) {
+        reasoningContentIndex = (output.content as unknown[]).length;
+        (output.content as unknown[]).push({ type: "thinking", thinking: "" });
+        stream.push({ type: "thinking_start", contentIndex: reasoningContentIndex, partial: output });
+      }
+      const block = (output.content as unknown[])[reasoningContentIndex] as { thinking: string };
+      block.thinking += delta;
+      stream.push({ type: "thinking_delta", contentIndex: reasoningContentIndex, delta, partial: output });
+    };
+
+    /**
+     * Route a reasoning delta through the assistant role filter.
+     * Buffers into pendingReasoningDeltas when role is not yet confirmed,
+     * mirroring the text pendingDeltas pattern.
+     */
+    const dispatchReasoning = (msgId: string, delta: string): void => {
+      if (!delta) return;
+      if (assistantMsgIds.has(msgId)) {
+        handleReasoningDelta(delta);
+      } else {
+        const buf = pendingReasoningDeltas.get(msgId) ?? [];
+        buf.push(delta);
+        pendingReasoningDeltas.set(msgId, buf);
+      }
+    };
+
+    /**
+     * Apply one text delta:
+     * - hasTool=true  → accumulate only; never push text events mid-stream.
+     * - hasTool=false → gate on first char (prose vs tool-call candidate).
+     */
     const handleTextDelta = (delta: string): void => {
       accumulatedText += delta;
+      if (hasTool) return; // defer all streaming until session.idle
 
       if (st.textMode === "buffered") return;
 
@@ -598,11 +626,7 @@ function streamOpenCode(
       }
     };
 
-    /**
-     * Dispatch a text delta for a given messageID.
-     * If the role is already confirmed as assistant, handle immediately.
-     * Otherwise buffer until role is confirmed via message.updated.
-     */
+    /** Dispatch a text delta through the role filter / pending buffer. */
     const dispatchDelta = (msgId: string, delta: string): void => {
       if (!delta) return;
       if (assistantMsgIds.has(msgId)) {
@@ -616,13 +640,19 @@ function streamOpenCode(
 
     /**
      * Called when message.updated confirms msgId is role=assistant.
-     * Flushes any deltas buffered before the confirmation arrived.
+     * Flushes both text and reasoning deltas buffered before confirmation.
      */
     const flushPending = (msgId: string): void => {
-      const pending = pendingDeltas.get(msgId);
-      if (!pending) return;
-      pendingDeltas.delete(msgId);
-      for (const delta of pending) handleTextDelta(delta);
+      const pendingText = pendingDeltas.get(msgId);
+      if (pendingText) {
+        pendingDeltas.delete(msgId);
+        for (const delta of pendingText) handleTextDelta(delta);
+      }
+      const pendingReasoning = pendingReasoningDeltas.get(msgId);
+      if (pendingReasoning) {
+        pendingReasoningDeltas.delete(msgId);
+        for (const delta of pendingReasoning) handleReasoningDelta(delta);
+      }
     };
 
     const cleanup = async () => {
@@ -641,7 +671,6 @@ function streamOpenCode(
 
       const baseUrl = await ensureServer();
 
-      // Create a fresh opencode session per OMP turn.
       const sessResp = await fetch(`${baseUrl}/session`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -651,7 +680,6 @@ function streamOpenCode(
       const sess = await sessResp.json() as { id: string };
       sessionId = sess.id;
 
-      // Open SSE connection before sending the prompt so no events are missed.
       const sseAbort = new AbortController();
       const onAbort = () => sseAbort.abort();
       options?.signal?.addEventListener("abort", onAbort, { once: true });
@@ -659,12 +687,10 @@ function streamOpenCode(
       const evtResp = await fetch(`${baseUrl}/event`, { signal: sseAbort.signal });
       sseReader = evtResp.body!.getReader();
 
-      // Extract providerID/modelID from "opencode/deepseek-v4-flash-free".
       const slashIdx = _model.id.indexOf("/");
       const providerID = slashIdx >= 0 ? _model.id.slice(0, slashIdx) : _model.id;
       const modelID = slashIdx >= 0 ? _model.id.slice(slashIdx + 1) : _model.id;
 
-      // Send prompt asynchronously (returns 204 immediately).
       const promptResp = await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -677,7 +703,7 @@ function streamOpenCode(
       });
       if (!promptResp.ok) throw new Error(`prompt_async failed: ${promptResp.status}`);
 
-      // ── Consume SSE stream ──────────────────────────────────────────────────
+      // ── SSE loop ────────────────────────────────────────────────────────────
       const dec = new TextDecoder();
       let sseRemainder = "";
       let done = false;
@@ -697,37 +723,45 @@ function streamOpenCode(
 
         for (const ev of parseSseBlocks(toProcess)) {
           if (ev.type === "message.updated") {
-            // Track which messageIDs belong to the assistant for this session.
             const props = ev.properties as OcMessageUpdated;
             if (props.info.sessionID === sessionId && props.info.role === "assistant") {
               assistantMsgIds.add(props.info.id);
-              flushPending(props.info.id);
+              flushPending(props.info.id); // flushes both text and reasoning pending
             }
 
           } else if (ev.type === "message.part.delta") {
-            // Flat/v1 shape observed in spike.
-            // Also updates partTextById so later snapshot events see the correct prev.
             const props = ev.properties as OcPartDelta;
-            if (props.sessionID === sessionId && props.field === "text" && props.delta) {
+            if (props.sessionID !== sessionId || !props.delta) continue;
+
+            if (props.field === "text") {
               const prev = partTextById.get(props.partID) ?? "";
               partTextById.set(props.partID, prev + props.delta);
               dispatchDelta(props.messageID, props.delta);
+            } else if (props.field === "reasoning") {
+              const prev = reasoningTextById.get(props.partID) ?? "";
+              reasoningTextById.set(props.partID, prev + props.delta);
+              dispatchReasoning(props.messageID, props.delta);
             }
 
           } else if (ev.type === "message.part.updated") {
-            // SDK canonical shape. `delta` is incremental when present.
-            // When absent, derive increment by diffing part.text against the
-            // stored snapshot — which may already include text from flat deltas
-            // for the same part, preventing double-emission.
             const props = ev.properties as OcPartUpdatedProps;
-            if (props.part.type === "text" && props.part.sessionID === sessionId) {
+            if (props.part.sessionID !== sessionId) continue;
+
+            if (props.part.type === "text") {
               const partId = props.part.id;
               const fullText = props.part.text;
               const prev = partTextById.get(partId) ?? "";
               const delta = props.delta ?? (fullText !== undefined ? fullText.slice(prev.length) : "");
-              // Update stored snapshot: prefer part.text as ground truth.
               partTextById.set(partId, fullText ?? prev + delta);
               dispatchDelta(props.part.messageID, delta);
+
+            } else if (props.part.type === "reasoning") {
+              const partId = props.part.id;
+              const fullText = props.part.text;
+              const prev = reasoningTextById.get(partId) ?? "";
+              const delta = props.delta ?? (fullText !== undefined ? fullText.slice(prev.length) : "");
+              reasoningTextById.set(partId, fullText ?? prev + delta);
+              dispatchReasoning(props.part.messageID, delta);
             }
 
           } else if (ev.type === "session.idle") {
@@ -738,37 +772,49 @@ function streamOpenCode(
       }
 
       options?.signal?.removeEventListener("abort", onAbort);
-      sseAbort.abort(); // release SSE connection
+      sseAbort.abort();
 
       if (options?.signal?.aborted) throw new Error("Request was aborted");
 
       setEstimatedUsage(output, prompt, accumulatedText);
 
-      // Only parse for tool calls when we haven't committed to streaming prose.
-      if (st.textMode !== "streaming") {
-        const toolCalls = parseToolCalls(accumulatedText);
-        if (toolCalls.length > 0) {
-          output.stopReason = "toolUse";
-          for (const call of toolCalls) {
-            const toolCall: ToolCall = {
-              type: "toolCall",
-              id: `opencode_omp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-              name: call.name,
-              arguments: call.arguments,
-            };
-            const contentIndex = (output.content as unknown[]).length;
-            (output.content as unknown[]).push(toolCall);
-            stream.push({ type: "toolcall_start", contentIndex, partial: output });
-            stream.push({ type: "toolcall_delta", contentIndex, delta: safeJson(toolCall.arguments), partial: output });
-            stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
-          }
-          stream.push({ type: "done", reason: "toolUse", message: output });
-          stream.end();
-          return;
-        }
+      // Close any open reasoning block before emitting the response.
+      if (reasoningContentIndex !== -1) {
+        const block = (output.content as unknown[])[reasoningContentIndex] as { thinking: string };
+        stream.push({ type: "thinking_end", contentIndex: reasoningContentIndex, content: block.thinking, partial: output });
       }
 
-      // Text response: close the streaming block or emit all buffered text at once.
+      // ── Tool call detection ─────────────────────────────────────────────────
+      // Always scan regardless of textMode. For hasTool=true nothing was
+      // streamed yet, so tool calls (even after a preamble) produce clean
+      // toolcall-only output with no leaked text.
+      const toolCalls = parseToolCalls(accumulatedText);
+      if (toolCalls.length > 0) {
+        // hasTool=false fallback: model disobeyed no-preamble instruction.
+        // Close the open streaming text block; preamble is visible but tool executes.
+        if (st.textMode === "streaming") {
+          stream.push({ type: "text_end", contentIndex: st.textContentIndex, content: accumulatedText, partial: output });
+        }
+        output.stopReason = "toolUse";
+        for (const call of toolCalls) {
+          const toolCall: ToolCall = {
+            type: "toolCall",
+            id: `opencode_omp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            name: call.name,
+            arguments: call.arguments,
+          };
+          const contentIndex = (output.content as unknown[]).length;
+          (output.content as unknown[]).push(toolCall);
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          stream.push({ type: "toolcall_delta", contentIndex, delta: safeJson(toolCall.arguments), partial: output });
+          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+        }
+        stream.push({ type: "done", reason: "toolUse", message: output });
+        stream.end();
+        return;
+      }
+
+      // ── Pure text response ──────────────────────────────────────────────────
       if (st.textMode === "streaming") {
         stream.push({ type: "text_end", contentIndex: st.textContentIndex, content: accumulatedText, partial: output });
       } else {
