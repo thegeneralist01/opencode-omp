@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import pkg from "../package.json" with { type: "json" };
+
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import {
   type Api,
@@ -27,7 +27,13 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "omp-model";
-const VERSION = pkg.version;
+const VERSION: string = (() => {
+  try {
+    return (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+  } catch {
+    return "unknown";
+  }
+})();
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
 const DISCOVERY_TIMEOUT_MS = 8_000;
