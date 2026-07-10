@@ -3,14 +3,15 @@
  * Run with: bun test/smoke.ts
  *
  * Uses a fake opencode HTTP server so no real model call is made.
- * Covers four invariants:
+ * Covers three invariants:
  *
  *  1. prose     — role filter, buffering, dual event shapes, snapshot diff.
  *  2. toolcall  — gating sees '<', buffered, tool emitted, no text events.
  *  3. mixed     — tool-capable turn: hasTool=true buffers all text so NO
- *                 text_delta events appear; reasoning flushed from
- *                 pendingReasoningDeltas via thinking_*; tool call detected
- *                 at session.idle; done(toolUse).
+ *                 text_start/text_delta/text_end events appear and no text
+ *                 block containing preamble/XML leaks into done.message.content;
+ *                 reasoning flushed from pendingReasoningDeltas via thinking_*;
+ *                 tool call detected at session.idle; done(toolUse).
  *
  * Between cases the singleton server is killed via the captured
  * `session_shutdown` handler so each case spawns a fresh child inheriting
@@ -166,13 +167,22 @@ process.env.FAKE_OC_MODE = "mixed";
 
 // ---------------------------------------------------------------------------
 // Path 3: mixed (tools in context → hasTool=true)
-//   Verifies:
-//   • reasoning delta arrives BEFORE assistant message.updated → buffered in
-//     pendingReasoningDeltas → flushed on message.updated confirmation
-//   • second reasoning delta via snapshot diff (no delta field)
-//   • thinking_start / thinking_delta(×2) / thinking_end fire
-//   • NO text_delta events (hasTool buffers all text)
-//   • toolcall_end(read) + done(toolUse)
+//
+//  What this covers:
+//  • reasoning delta arrives BEFORE assistant message.updated → buffered in
+//    pendingReasoningDeltas → flushed on message.updated confirmation
+//  • second reasoning delta via snapshot diff (updated-shape, no delta field)
+//  • thinking_start / thinking_delta(×2) / thinking_end fire
+//  • NO text_start / text_delta / text_end (hasTool buffers all text)
+//  • done.message.content has no text block containing preamble or XML —
+//    catches finalization-only leaks that mid-stream checks would miss
+//  • toolcall_end(read) + done(toolUse)
+//
+//  What this does NOT cover:
+//  • Untagged chain-of-thought emitted as field:"text" on a prose turn —
+//    hasTool buffering only applies when context.tools is non-empty; models
+//    that leak reasoning as ordinary text on tool-free turns will still
+//    show it (prompt instruction reduces likelihood, doesn't eliminate it).
 // ---------------------------------------------------------------------------
 
 {
@@ -182,20 +192,40 @@ process.env.FAKE_OC_MODE = "mixed";
   const thinkingDeltas: string[] = [];
   let toolName = "<not seen>";
   let doneReason = "<not seen>";
+  let doneContent: unknown[] = [];
 
   for await (const ev of stream) {
     const e = ev as Record<string, unknown>;
     types.push(e.type as string);
     if (e.type === "thinking_delta") thinkingDeltas.push(e.delta as string);
     if (e.type === "toolcall_end") toolName = (e.toolCall as Record<string, unknown>).name as string;
-    if (e.type === "done") doneReason = e.reason as string;
+    if (e.type === "done") {
+      doneReason = e.reason as string;
+      doneContent = ((e.message as Record<string, unknown>)?.content as unknown[]) ?? [];
+    }
   }
 
-  // No text events — hasTool=true suppresses mid-stream text_delta.
+  // ── No text events at any stage ───────────────────────────────────────────
+  if (types.includes("text_start"))
+    throw new Error(`mixed: text_start leaked (hasTool must buffer): ${JSON.stringify(types)}`);
   if (types.includes("text_delta"))
     throw new Error(`mixed: text_delta leaked (hasTool must buffer): ${JSON.stringify(types)}`);
+  if (types.includes("text_end"))
+    throw new Error(`mixed: text_end leaked (hasTool must buffer): ${JSON.stringify(types)}`);
 
-  // Reasoning routed through thinking channel.
+  // ── done.message.content must have no text block with preamble or XML ────
+  // Catches leaks that occur only at finalization (e.g. a stray text block
+  // emitted after all streaming events are done).
+  const leakedTextBlock = doneContent.find((block) => {
+    if (typeof block !== "object" || block === null) return false;
+    const b = block as Record<string, unknown>;
+    return b.type === "text" && typeof b.text === "string" &&
+      (b.text.includes("Let me read") || b.text.includes("omp_tool_call"));
+  });
+  if (leakedTextBlock)
+    throw new Error(`mixed: preamble/XML leaked into done.message.content: ${JSON.stringify(leakedTextBlock)}`);
+
+  // ── Reasoning routed through thinking channel ─────────────────────────────
   if (!types.includes("thinking_start"))
     throw new Error("mixed: missing thinking_start");
   if (thinkingDeltas.length < 2)
@@ -203,14 +233,14 @@ process.env.FAKE_OC_MODE = "mixed";
   if (!types.includes("thinking_end"))
     throw new Error("mixed: missing thinking_end");
 
-  // First reasoning delta was buffered before message.updated, then flushed.
+  // Pre-confirmation reasoning (buffered in pendingReasoningDeltas, flushed).
   if (!thinkingDeltas.join("").includes("The user wants to explore"))
     throw new Error(`mixed: pre-confirmation reasoning missing from thinking_delta: ${JSON.stringify(thinkingDeltas)}`);
-  // Second reasoning delta from snapshot diff.
+  // Snapshot-diff reasoning (derived from part.text without delta field).
   if (!thinkingDeltas.join("").includes("I should read it"))
     throw new Error(`mixed: snapshot-diff reasoning missing from thinking_delta: ${JSON.stringify(thinkingDeltas)}`);
 
-  // Tool call detected at session.idle, emitted cleanly.
+  // ── Tool call emitted cleanly ─────────────────────────────────────────────
   if (!types.includes("toolcall_end"))
     throw new Error("mixed: missing toolcall_end");
   if (toolName !== "read")
@@ -218,7 +248,7 @@ process.env.FAKE_OC_MODE = "mixed";
   if (doneReason !== "toolUse")
     throw new Error(`mixed: done.reason="${doneReason}"`);
 
-  console.log(`✓ mixed: thinking_delta(×${thinkingDeltas.length}) → no text_delta → toolcall_end(${toolName}) → done(toolUse)`);
+  console.log(`✓ mixed: thinking_delta(×${thinkingDeltas.length}) → no text_* → toolcall_end(${toolName}) → done(toolUse)`);
 }
 
 // Kill server so the process exits cleanly.
