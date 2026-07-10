@@ -836,30 +836,33 @@ export default async function openCodeOmpExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
       if (sub === "status") {
-        for (const line of statusLines()) ctx.ui.notify(line, "info");
-        return;
-      }
+              ctx.ui.notify(statusLines().join("\n"), "info");
+              return;
+            }
       if (sub === "models") {
-        for (const model of registeredModels) ctx.ui.notify(`${PROVIDER_ID}/${model}`, "info");
-        ctx.ui.notify(`Override with OPENCODE_OMP_MODELS="opencode/model-a,opencode/model-b"`, "info");
-        return;
-      }
+              const modelLines = registeredModels.map((m) => `  ${PROVIDER_ID}/${m}`);
+              modelLines.push(`\nOverride with OPENCODE_OMP_MODELS="opencode/model-a,opencode/model-b"`);
+              ctx.ui.notify(modelLines.join("\n"), "info");
+              return;
+            }
       if (sub === "test") {
         const testModel = registeredModels[0] ?? DEFAULT_FREE_MODELS[0];
         ctx.ui.notify(`Run: omp -p --provider ${PROVIDER_ID} --model ${testModel} "Reply with exactly OK"`, "info");
         return;
       }
       if (sub === "update") {
-        await refreshModels(pi, ctx);
-        for (const line of statusLines()) ctx.ui.notify(line, "info");
-        return;
-      }
+              await refreshModels(pi, ctx);
+              ctx.ui.notify(statusLines().join("\n"), "info");
+              return;
+            }
       if (sub === "help") {
-        ctx.ui.notify("Usage: /opencode-omp [status|models|test|update|help]", "info");
-        ctx.ui.notify("Set OPENCODE_OMP_BIN to override the opencode executable.", "info");
-        ctx.ui.notify("Set OPENCODE_OMP_MODELS to register a custom comma-separated model list.", "info");
-        return;
-      }
+              ctx.ui.notify([
+                "Usage: /opencode-omp [status|models|test|update|help]",
+                "Set OPENCODE_OMP_BIN to override the opencode executable.",
+                "Set OPENCODE_OMP_MODELS to register a custom comma-separated model list.",
+              ].join("\n"), "info");
+              return;
+            }
       ctx.ui.notify(`Unknown /opencode-omp subcommand: ${sub}. Try /opencode-omp help`, "warning");
     },
   });
