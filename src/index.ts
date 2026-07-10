@@ -853,7 +853,7 @@ export default async function openCodeOmpExtension(pi: ExtensionAPI) {
             }
       if (sub === "test") {
         const testModel = registeredModels[0] ?? DEFAULT_FREE_MODELS[0];
-        ctx.ui.notify(`Run: omp -p --provider ${PROVIDER_ID} --model ${testModel} "Reply with exactly OK"`, "info");
+        ctx.ui.notify(`Run: omp -p --model ${PROVIDER_ID}/${testModel} "Reply with exactly OK"`, "info");
         return;
       }
       if (sub === "update") {

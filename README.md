@@ -22,30 +22,21 @@ opencode models opencode   # verify free models are listed
 ## Install
 
 ```bash
-omp plugin install npm:opencode-omp
+omp plugin install github:thegeneralist01/opencode-omp
 ```
 
-Then `/reload` in OMP (or restart). Pick the provider with `/model` or pass it directly:
+Then `/reload` in OMP (or restart). Pick the model with `/model` and select from the `opencode-cli` provider, or pass it directly:
 
 ```bash
-omp --provider opencode-cli --model opencode/deepseek-v4-flash-free
+omp -p --model opencode-cli/opencode/deepseek-v4-flash-free "Reply with exactly OK"
 ```
 
-Smoke test:
-
-```bash
-omp -p --provider opencode-cli --model opencode/deepseek-v4-flash-free "Reply with exactly OK"
-```
-
-> **Installing from GitHub (before the next npm publish):**
-> ```bash
-> omp plugin install github:thegeneralist01/opencode-omp
-> ```
+> **npm** (`npm:opencode-omp`) currently serves 1.0.0. Use the GitHub install path above to get 1.2.0.
 
 ## Commands
 
 ```
-/opencode-omp status    list registered models and last discovery time
+/opencode-omp status    version, server state, registered models
 /opencode-omp models    list registered model IDs
 /opencode-omp update    re-query opencode for the current free model roster
 /opencode-omp test      print a smoke-test command to run manually
@@ -88,6 +79,6 @@ File access and edits stay under OMP's normal tool pipeline; OpenCode cannot tou
 ## Update / uninstall
 
 ```bash
-omp plugin install npm:opencode-omp@latest   # update
-omp plugin uninstall opencode-omp            # remove
+omp plugin install github:thegeneralist01/opencode-omp   # update
+omp plugin uninstall opencode-omp                        # remove
 ```
