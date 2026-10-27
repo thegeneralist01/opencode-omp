@@ -47,11 +47,6 @@ const DEFAULT_FREE_MODELS = [
   "opencode/big-pickle",
 ];
 
-const DISABLED_TOOLS: Record<string, false> = {
-  bash: false, edit: false, read: false, glob: false, grep: false,
-  list: false, task: false, webfetch: false, websearch: false, todowrite: false,
-};
-
 // ---------------------------------------------------------------------------
 // Named types
 // ---------------------------------------------------------------------------
@@ -245,16 +240,27 @@ async function refreshModels(
 // Server management
 // ---------------------------------------------------------------------------
 
+// The Zen free tier rejects a request whose tools array lacks `bash` or `read`
+// (anomalyco/opencode#49723): a flat `deny` — and the request-level
+// `tools: { bash: false }` map this extension used to send — remove the tool
+// from the outgoing request entirely (opencode's Permission.disabled() hides a
+// tool when its last matching rule is pattern `*` with action `deny`). A
+// pattern map keeps the tool advertised while denying execution: only the
+// no-op `true` runs, and only this agent's own file is readable.
 const AGENT_INSTRUCTIONS = `---
-description: Text-only OMP bridge agent. OpenCode tools are denied; OMP tool calls are emitted as text markers.
+description: Text-only OMP bridge agent. OpenCode tools are execution-denied; OMP tool calls are emitted as text markers.
 mode: primary
 permission:
-  read: deny
+  bash:
+    "*": deny
+    "true": allow
+  read:
+    "*": deny
+    ".opencode/agents/${AGENT_ID}.md": allow
   edit: deny
   glob: deny
   grep: deny
   list: deny
-  bash: deny
   task: deny
   external_directory: deny
   todowrite: deny
@@ -644,7 +650,6 @@ function streamOpenCode(
         body: JSON.stringify({
           model: { providerID, modelID },
           agent: AGENT_ID,
-          tools: DISABLED_TOOLS,
           parts: [{ type: "text", text: prompt }],
         }),
       });

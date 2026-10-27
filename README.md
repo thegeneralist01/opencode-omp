@@ -56,7 +56,7 @@ OPENCODE_OMP_MODELS="opencode/deepseek-v4-flash-free,opencode/big-pickle" omp
 
 ## How it works
 
-On the first model turn the extension starts a persistent `opencode serve` subprocess in a locked-down temp directory (all OpenCode tools denied). The server is reused across turns and shut down when the OMP session ends.
+On the first model turn the extension starts a persistent `opencode serve` subprocess in a locked-down temp directory. OpenCode's tools are denied at execution (not removed from the request): `bash` and `read` carry a narrow allow rule — only the no-op `true` runs, and only the agent's own instruction file is readable — because OpenCode's Zen free tier rejects any request whose tools array lacks them ([anomalyco/opencode#49723](https://github.com/anomalyco/opencode/issues/49723)). The server is reused across turns and shut down when the OMP session ends.
 
 For each turn:
 

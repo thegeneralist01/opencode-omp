@@ -43,6 +43,12 @@ if (args[0] === "serve") {
   const ASST_PART_ID = "p-a-1";    // text part
   const ASST_REASON_ID = "p-r-1";  // reasoning part
 
+  // Smoke-test probe: the prompt_async body and the generated agent config.
+  // The Zen free tier rejects requests that drop bash/read (#49723), so the
+  // smoke test asserts this extension keeps bash/read advertised.
+  const fixturesFile = process.env.FAKE_OC_FIXTURES;
+  const promptBodies: unknown[] = [];
+
   function sseEvent(type: string, properties: unknown): string {
     return `data: ${JSON.stringify({ type, properties })}\n\n`;
   }
@@ -122,7 +128,7 @@ if (args[0] === "serve") {
 
   Bun.serve({
     port,
-    fetch(req) {
+    async fetch(req) {
       const url = new URL(req.url);
       const path = url.pathname;
       if (req.method === "POST" && path === "/session") return Response.json({ id: SESSION_ID });
@@ -131,7 +137,14 @@ if (args[0] === "serve") {
           headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
         });
       }
-      if (req.method === "POST" && path === `/session/${SESSION_ID}/prompt_async`) return new Response(null, { status: 204 });
+      if (req.method === "POST" && path === `/session/${SESSION_ID}/prompt_async`) {
+        promptBodies.push(await req.json().catch(() => undefined));
+        if (fixturesFile) {
+          const agentFile = await Bun.file(".opencode/agents/omp-model.md").text().catch(() => "");
+          await Bun.write(fixturesFile, JSON.stringify({ prompts: promptBodies, agentFile }));
+        }
+        return new Response(null, { status: 204 });
+      }
       if (req.method === "DELETE" && path === `/session/${SESSION_ID}`) return new Response(null, { status: 200 });
       return new Response("not found", { status: 404 });
     },

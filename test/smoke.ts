@@ -3,7 +3,7 @@
  * Run with: bun test/smoke.ts
  *
  * Uses a fake opencode HTTP server so no real model call is made.
- * Covers three invariants:
+ * Covers four invariants:
  *
  *  1. prose     — role filter, buffering, dual event shapes, snapshot diff.
  *  2. toolcall  — gating sees '<', buffered, tool emitted, no text events.
@@ -12,11 +12,17 @@
  *                 block containing preamble/XML leaks into done.message.content;
  *                 reasoning flushed from pendingReasoningDeltas via thinking_*;
  *                 tool call detected at session.idle; done(toolUse).
+ *  4. gate      — the prompt_async body carries no request-level tools map and
+ *                 the generated agent keeps bash/read advertised with pattern
+ *                 denies (anomalyco/opencode#49723: the Zen free tier rejects a
+ *                 request whose tools array lacks them).
  *
  * Between cases the singleton server is killed via the captured
  * `session_shutdown` handler so each case spawns a fresh child inheriting
  * the updated FAKE_OC_MODE env var.
  */
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Api, Context, Model, Tool } from "@oh-my-pi/pi-ai";
@@ -28,6 +34,8 @@ import openCodeOmpExtension from "../src/index.ts";
 // ---------------------------------------------------------------------------
 
 process.env.OPENCODE_OMP_BIN = join(import.meta.dirname, "fake-opencode.ts");
+const fixturesPath = join(tmpdir(), `opencode-omp-fixtures-${process.pid}.json`);
+process.env.FAKE_OC_FIXTURES = fixturesPath;
 
 // ---------------------------------------------------------------------------
 // Capture streamSimple and event handlers
@@ -125,6 +133,34 @@ const contextWithTools: Context = {
   if (doneReason !== "stop") throw new Error(`prose: done.reason="${doneReason}"`);
 
   console.log(`✓ prose: start → delta(×${deltaIdxs.length}: ${JSON.stringify(deltas)}) → end("${finalText}") → done(stop)`);
+}
+
+// ---------------------------------------------------------------------------
+// Path 1b: gate (view of the request the fake recorded during the prose turn)
+// ---------------------------------------------------------------------------
+
+{
+  const fixtures = JSON.parse(readFileSync(fixturesPath, "utf8")) as {
+    prompts: Record<string, unknown>[];
+    agentFile: string;
+  };
+  const last = fixtures.prompts.at(-1);
+  if (!last) throw new Error("gate: fake opencode recorded no prompt_async body");
+  if (last.agent !== "omp-model") throw new Error(`gate: prompt_async agent="${String(last.agent)}"`);
+  if ("tools" in last)
+    throw new Error(`gate: request-level tools map sent (${JSON.stringify(last.tools)}) — flat false drops bash/read`);
+
+  for (const [tool, allow] of [
+    ["bash", '"true": allow'],
+    ["read", '".opencode/agents/omp-model.md": allow'],
+  ] as const) {
+    if (!fixtures.agentFile.includes(`  ${tool}:\n    "*": deny\n    ${allow}`))
+      throw new Error(`gate: agent config lost the pattern deny for ${tool}:\n${fixtures.agentFile}`);
+    if (fixtures.agentFile.includes(`\n  ${tool}: deny`))
+      throw new Error(`gate: agent config denies ${tool} flat — the tool disappears from the request`);
+  }
+
+  console.log("✓ gate: no request tools map; agent keeps bash/read advertised via pattern denies");
 }
 
 await eventHandlers.get("session_shutdown")?.();
@@ -253,5 +289,6 @@ process.env.FAKE_OC_MODE = "mixed";
 
 // Kill server so the process exits cleanly.
 await eventHandlers.get("session_shutdown")?.();
+rmSync(fixturesPath, { force: true });
 
 console.log("\nAll smoke tests passed.");
