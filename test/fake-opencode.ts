@@ -21,7 +21,15 @@
  *             3. second reasoning delta via snapshot diff (no delta field).
  *             4. text preamble + tool call buffered by hasTool=true.
  *             5. No text_delta events must appear.
+ * error     opencode's shape for a failed turn: session.error, then idle.
+ * retry     A free-tier refusal: a retry status carrying an action, then the
+ *           stream stays open, as opencode waits for the limit to reset.
+ *
+ * FAKE_OC_CALLS, when set, names a file that gets one line per abort/delete
+ * request, so a test can see how the bridge released the session.
  */
+
+import { appendFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 
@@ -64,6 +72,27 @@ if (args[0] === "serve") {
         // "!" via snapshot-only (no delta → text.slice(prev)).
         sseEvent("message.part.updated", { part: { id: ASST_PART_ID, type: "text", sessionID: SESSION_ID, messageID: ASST_MSG_ID, text: "Hello, world!" } }),
         sseEvent("session.idle", { sessionID: SESSION_ID }),
+      ].join("");
+    }
+
+    // ── error ─────────────────────────────────────────────────────────────────
+    if (mode === "error") {
+      return [
+        sseEvent("session.status", { sessionID: SESSION_ID, status: { type: "busy" } }),
+        sseEvent("session.error", { sessionID: SESSION_ID, error: { name: "UnknownError", data: { message: "Model not found: opencode/no-such-model" } } }),
+        sseEvent("session.status", { sessionID: SESSION_ID, status: { type: "idle" } }),
+        sseEvent("session.idle", { sessionID: SESSION_ID }),
+      ].join("");
+    }
+
+    // ── retry ─────────────────────────────────────────────────────────────────
+    // The retry of another session must not end this turn.
+    if (mode === "retry") {
+      const action = { reason: "free_tier_limit", provider: "opencode", title: "Free limit reached", label: "subscribe", link: "https://opencode.ai/go" };
+      return [
+        sseEvent("session.status", { sessionID: SESSION_ID, status: { type: "busy" } }),
+        sseEvent("session.status", { sessionID: "other-session", status: { type: "retry", attempt: 1, message: "not this turn", action } }),
+        sseEvent("session.status", { sessionID: SESSION_ID, status: { type: "retry", attempt: 1, message: "Free usage exceeded, subscribe to Go", action, next: Date.now() + 14 * 3_600_000 } }),
       ].join("");
     }
 
@@ -120,19 +149,28 @@ if (args[0] === "serve") {
     ].join("");
   }
 
+  function record(call: string): void {
+    if (process.env.FAKE_OC_CALLS) appendFileSync(process.env.FAKE_OC_CALLS, `${call}\n`);
+  }
+
   Bun.serve({
     port,
+    idleTimeout: 0,
     fetch(req) {
       const url = new URL(req.url);
       const path = url.pathname;
       if (req.method === "POST" && path === "/session") return Response.json({ id: SESSION_ID });
       if (req.method === "GET" && path === "/event") {
-        return new Response(buildSseBody(), {
-          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
-        });
+        const body = buildSseBody();
+        const headers = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" };
+        if (process.env.FAKE_OC_MODE !== "retry") return new Response(body, { headers });
+        // Like opencode, keep the stream open while the session waits to retry.
+        const open = new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(body)); } });
+        return new Response(open, { headers });
       }
       if (req.method === "POST" && path === `/session/${SESSION_ID}/prompt_async`) return new Response(null, { status: 204 });
-      if (req.method === "DELETE" && path === `/session/${SESSION_ID}`) return new Response(null, { status: 200 });
+      if (req.method === "POST" && path === `/session/${SESSION_ID}/abort`) { record("abort"); return Response.json(true); }
+      if (req.method === "DELETE" && path === `/session/${SESSION_ID}`) { record("delete"); return new Response(null, { status: 200 }); }
       return new Response("not found", { status: 404 });
     },
   });

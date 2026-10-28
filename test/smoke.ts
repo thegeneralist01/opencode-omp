@@ -3,7 +3,7 @@
  * Run with: bun test/smoke.ts
  *
  * Uses a fake opencode HTTP server so no real model call is made.
- * Covers three invariants:
+ * Covers five invariants:
  *
  *  1. prose     — role filter, buffering, dual event shapes, snapshot diff.
  *  2. toolcall  — gating sees '<', buffered, tool emitted, no text events.
@@ -12,11 +12,17 @@
  *                 block containing preamble/XML leaks into done.message.content;
  *                 reasoning flushed from pendingReasoningDeltas via thinking_*;
  *                 tool call detected at session.idle; done(toolUse).
+ *  4. error     — opencode's session.error ends the turn with its message,
+ *                 not an empty done(stop).
+ *  5. retry     — a retry that needs the user (free-tier limit) ends the turn
+ *                 at once and aborts the session, instead of waiting hours.
  *
  * Between cases the singleton server is killed via the captured
  * `session_shutdown` handler so each case spawns a fresh child inheriting
  * the updated FAKE_OC_MODE env var.
  */
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Api, Context, Model, Tool } from "@oh-my-pi/pi-ai";
@@ -250,6 +256,67 @@ process.env.FAKE_OC_MODE = "mixed";
 
   console.log(`✓ mixed: thinking_delta(×${thinkingDeltas.length}) → no text_* → toolcall_end(${toolName}) → done(toolUse)`);
 }
+
+/** Every event of one turn; fails the test if the turn has not ended within 5s. */
+async function drain(stream: AsyncIterable<unknown>, label: string): Promise<Record<string, unknown>[]> {
+  const events: Record<string, unknown>[] = [];
+  const { promise: deadline, reject } = Promise.withResolvers<never>();
+  const timer = setTimeout(() => reject(new Error(`${label}: the turn did not end within 5s`)), 5_000);
+  const read = (async () => { for await (const ev of stream) events.push(ev as Record<string, unknown>); })();
+  try { await Promise.race([read, deadline]); } finally { clearTimeout(timer); }
+  return events;
+}
+
+/** The error text of a turn's `error` event; fails the test when the turn did not end in one. */
+function turnError(events: Record<string, unknown>[], label: string): string {
+  const types = events.map((e) => e.type as string);
+  const failure = events.find((e) => e.type === "error");
+  if (!failure) throw new Error(`${label}: expected an error event, got ${JSON.stringify(types)}`);
+  if (types.includes("done")) throw new Error(`${label}: a failed turn also ended as done: ${JSON.stringify(types)}`);
+  if (failure.reason !== "error") throw new Error(`${label}: error.reason="${failure.reason}"`);
+  return (failure.error as Record<string, unknown>).errorMessage as string;
+}
+
+await eventHandlers.get("session_shutdown")?.();
+process.env.FAKE_OC_MODE = "error";
+
+// ---------------------------------------------------------------------------
+// Path 4: error (opencode reports a failed turn, then goes idle)
+// ---------------------------------------------------------------------------
+
+{
+  const message = turnError(await drain(streamSimple(model, context), "error"), "error");
+  if (message !== "opencode: Model not found: opencode/no-such-model")
+    throw new Error(`error: errorMessage="${message}"`);
+  console.log(`✓ error: session.error → error("${message}")`);
+}
+
+await eventHandlers.get("session_shutdown")?.();
+process.env.FAKE_OC_MODE = "retry";
+const callsDir = await mkdtemp(join(tmpdir(), "opencode-omp-smoke-"));
+process.env.FAKE_OC_CALLS = join(callsDir, "calls.txt");
+
+// ---------------------------------------------------------------------------
+// Path 5: retry with an action (free-tier limit; the stream stays open)
+// ---------------------------------------------------------------------------
+
+{
+  const message = turnError(await drain(streamSimple(model, context), "retry"), "retry");
+  const expected = "opencode: Free limit reached: Free usage exceeded, subscribe to Go (https://opencode.ai/go)";
+  if (message !== expected) throw new Error(`retry: errorMessage="${message}", expected "${expected}"`);
+
+  // The session is released after the turn ends: abort first, since a DELETE leaves the retry loop running.
+  let calls = "";
+  for (let i = 0; i < 40 && !calls.includes("delete"); i++) {
+    await Bun.sleep(50);
+    calls = await readFile(process.env.FAKE_OC_CALLS, "utf8").catch(() => "");
+  }
+  if (calls !== "abort\ndelete\n") throw new Error(`retry: session release calls ${JSON.stringify(calls)}, expected abort then delete`);
+  console.log(`✓ retry: free-tier retry → error("${message}") → abort, delete`);
+}
+
+delete process.env.FAKE_OC_CALLS;
+await rm(callsDir, { recursive: true, force: true });
 
 // Kill server so the process exits cleanly.
 await eventHandlers.get("session_shutdown")?.();

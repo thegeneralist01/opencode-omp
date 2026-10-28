@@ -96,6 +96,36 @@ interface OcSessionIdle {
   sessionID: string;
 }
 
+interface OcSessionError {
+  sessionID?: string;
+  error?: { name?: string; data?: { message?: string } };
+}
+
+/** What opencode attaches to a retry the user has to act on (e.g. `free_tier_limit`, `account_rate_limit`). */
+interface OcRetryAction {
+  reason?: string;
+  title?: string;
+  link?: string;
+}
+
+interface OcSessionStatus {
+  sessionID: string;
+  status: { type: string; message?: string; action?: OcRetryAction };
+}
+
+/** The turn's error text for a `session.error` opencode reported on its session. */
+function sessionErrorText(props: OcSessionError): string {
+  const detail = props.error?.data?.message ?? props.error?.name ?? "unknown error";
+  return `opencode: ${detail}`;
+}
+
+/** The turn's error text for a retry opencode cannot get past without the user (it would wait until `next`). */
+function retryActionText(status: OcSessionStatus["status"]): string {
+  const action = status.action ?? {};
+  const what = [action.title, status.message].filter(Boolean).join(": ") || action.reason || "retry needs action";
+  return `opencode: ${what}${action.link ? ` (${action.link})` : ""}`;
+}
+
 type NotifyFn = (msg: string, level?: "error" | "info" | "warning") => void;
 
 // ---------------------------------------------------------------------------
@@ -515,6 +545,7 @@ function streamOpenCode(
     let reasoningContentIndex = -1;
     let accumulatedText = "";
     let sessionId: string | undefined;
+    let sessionIdle = false;
     let sseReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     const prompt = buildPrompt(context);
 
@@ -607,6 +638,10 @@ function streamOpenCode(
       if (sessionId) {
         const baseUrl = ocServer?.url;
         if (baseUrl) {
+          // DELETE alone leaves a running session working: a retry loop keeps calling the provider. Abort it first.
+          if (!sessionIdle) {
+            await fetch(`${baseUrl}/session/${sessionId}/abort`, { method: "POST" }).catch(() => undefined);
+          }
           await fetch(`${baseUrl}/session/${sessionId}`, { method: "DELETE" }).catch(() => undefined);
         }
         sessionId = undefined;
@@ -706,7 +741,17 @@ function streamOpenCode(
             }
           } else if (ev.type === "session.idle") {
             const props = ev.properties as OcSessionIdle;
-            if (props.sessionID === sessionId) { done = true; break; }
+            if (props.sessionID === sessionId) { sessionIdle = true; done = true; break; }
+          } else if (ev.type === "session.error") {
+            // opencode reports a failed turn here, then goes idle: end with its error, not an empty reply.
+            const props = ev.properties as OcSessionError;
+            if (props.sessionID === sessionId) throw new Error(sessionErrorText(props));
+          } else if (ev.type === "session.status") {
+            // A retry with an action (free-tier limit, account rate limit) waits until the limit resets, often hours.
+            const props = ev.properties as OcSessionStatus;
+            if (props.sessionID === sessionId && props.status.type === "retry" && props.status.action) {
+              throw new Error(retryActionText(props.status));
+            }
           }
         }
       }
